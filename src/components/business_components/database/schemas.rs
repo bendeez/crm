@@ -178,6 +178,15 @@ pub struct RowColumnValue {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct RowInsertData {
+    pub column_names: Vec<String>,
+    pub data_types: Vec<DataType>,
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum TableDataChangeEvents {
     ModifyRowColumnValue(RowColumnValue),
+    DeleteRow(Vec<Condition>),
+    InsertRow(RowInsertData),
 }

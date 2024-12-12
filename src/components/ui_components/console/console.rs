@@ -121,7 +121,6 @@ impl ConsoleUI {
         let scrollable_console = scrollable(
             container(console_display)
                 .style(|_| console_style())
-                .height(Length::Fill)
                 .padding(10),
         )
         .height(Length::Fill)

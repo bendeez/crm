@@ -336,13 +336,11 @@ impl TablesUI {
             tables_column = tables_column.push(table_row);
         }
 
-        let content = scrollable(tables_column).height(Length::Fill);
-
         if !self.table_to_delete.is_none() {
             return self.delete_table_confirmation_modal();
         }
 
-        content.into()
+        tables_column.into()
     } // ======================== SECTION: Create Table ========================
 
     fn get_table_filter_regex(&self) -> Regex {

@@ -3,8 +3,8 @@ use crate::components::business_components::database::{
     database::create_database_pool,
     models::{ColumnsInfo, PrimaryKeyConstraint, TableGeneralInfo},
     schemas::{
-        ColumnForeignKey, Constraint, DataType, TableChangeEvents, TableDataChangeEvents, TableIn,
-        TableInsertedData,
+        ColumnForeignKey, Condition, Constraint, DataType, TableChangeEvents,
+        TableDataChangeEvents, TableIn, TableInsertedData,
     },
 };
 use sqlx::{postgres::PgRow, Executor, PgPool, Postgres, Row, Transaction};
@@ -58,7 +58,6 @@ impl Repository {
             .into_iter()
             .map(|row| row.get("column_name"))
             .collect();
-        self.log_query(query.replace("$1", table_name));
         Ok(primary_key_column_names)
     }
 
@@ -198,49 +197,122 @@ impl Repository {
         self.log_query(query).await;
     }
 
+    fn get_filter_condition(&self, conditions: &Vec<Condition>) -> String {
+        conditions
+            .iter()
+            .map(|condition| format!("{} = {}", condition.column_name, condition.value))
+            .collect::<Vec<String>>()
+            .join(" AND ")
+    }
+
     pub async fn update_table_data(
         &self,
         table_name: &str,
         table_data_change_events: &Vec<TableDataChangeEvents>,
+        primary_key_column_names: &Vec<String>,
     ) -> Result<(), sqlx::Error> {
         // Start a transaction
         let mut transaction = self.pool.begin().await?;
 
         for event in table_data_change_events {
-            if let TableDataChangeEvents::ModifyRowColumnValue(row_column_value) = event {
-                let filter_condition = row_column_value
-                    .conditions
-                    .iter()
-                    .map(|condition| format!("{} = {}", condition.column_name, condition.value))
-                    .collect::<Vec<String>>()
-                    .join(" AND ");
-                // Construct the SQL UPDATE query with dynamic row numbers
-                let bind_parameter = if row_column_value.data_type == DataType::INTEGER {
-                    "$1::INTEGER"
-                } else {
-                    "$1"
-                };
-                let query = format!(
-                    "
+            match event {
+                TableDataChangeEvents::ModifyRowColumnValue(row_column_value) => {
+                    let filter_condition = self.get_filter_condition(&row_column_value.conditions);
+                    // Construct the SQL UPDATE query with dynamic row numbers
+                    let bind_parameter = if row_column_value.data_type == DataType::INTEGER {
+                        "$1::INTEGER"
+                    } else {
+                        "$1"
+                    };
+                    let query = format!(
+                        "
                         UPDATE \"{}\"
                         SET \"{}\" = {} 
                         WHERE {}
                        ",
-                    table_name,                   // Table for the update
-                    row_column_value.column_name, // Column to update
-                    bind_parameter,
-                    filter_condition
-                );
-                let parameters = (&row_column_value.new_value,);
+                        table_name,                   // Table for the update
+                        row_column_value.column_name, // Column to update
+                        bind_parameter,
+                        filter_condition
+                    );
+                    let parameters = (&row_column_value.new_value,);
 
-                // Execute the query with parameters
-                println!("{}", query);
-                sqlx::query(&query)
-                    .bind(parameters.0) // Bind the new value
-                    .execute(&mut *transaction)
-                    .await
-                    .unwrap();
-                self.log_query(query.replace("$1", parameters.0)).await;
+                    // Execute the query with parameters
+                    println!("{}", query);
+                    sqlx::query(&query)
+                        .bind(parameters.0) // Bind the new value
+                        .execute(&mut *transaction)
+                        .await
+                        .unwrap();
+                    self.log_query(query.replace("$1", parameters.0)).await;
+                }
+
+                TableDataChangeEvents::DeleteRow(conditions) => {
+                    let filter_condition = self.get_filter_condition(&conditions);
+                    let query =
+                        format!("DELETE FROM \"{}\" WHERE {}", table_name, filter_condition);
+                    println!("{}", query);
+                    sqlx::query(&query)
+                        .execute(&mut *transaction)
+                        .await
+                        .unwrap();
+                    self.log_query(query).await;
+                }
+
+                TableDataChangeEvents::InsertRow(row_insert_data) => {
+                    let (column_names, values): (Vec<String>, Vec<String>) = row_insert_data
+                        .column_names
+                        .iter()
+                        .zip(
+                            row_insert_data
+                                .values
+                                .iter()
+                                .zip(row_insert_data.data_types.iter()),
+                        )
+                        .map(|(column_name, (value, data_type))| {
+                            // Map the filtered columns to (column_name, value) pairs
+                            if value.is_empty() && primary_key_column_names.contains(column_name) {
+                                // Generate values for primary key columns
+                                let generated_value = if *data_type == DataType::INTEGER {
+                                    format!(
+                                        "(SELECT COUNT(\"{}\") + 1 FROM \"{}\")",
+                                        column_name, table_name
+                                    )
+                                } else if *data_type == DataType::TEXT {
+                                    "gen_random_uuid()::TEXT".to_string()
+                                } else {
+                                    "NULL".to_string() // Fallback for unsupported types
+                                };
+
+                                (column_name.to_string(), generated_value)
+                            } else {
+                                (
+                                    column_name.to_string(),
+                                    if value.is_empty() {
+                                        "NULL".to_string()
+                                    } else if *data_type == DataType::TEXT {
+                                        format!("'{}'", value)
+                                    } else {
+                                        value.to_string()
+                                    },
+                                )
+                            }
+                        })
+                        .unzip();
+                    let query = format!(
+                        "INSERT INTO \"{}\" ({}) VALUES {}",
+                        table_name,
+                        column_names.join(", "),
+                        format!("({})", values.join(", "))
+                    );
+
+                    println!("{}", query);
+                    sqlx::query(&query)
+                        .execute(&mut *transaction)
+                        .await
+                        .unwrap();
+                    self.log_query(query).await;
+                }
             }
         }
 
@@ -276,40 +348,6 @@ impl Repository {
         );
         let table_data_rows = sqlx::query(&query).fetch_all(&self.pool).await;
         table_data_rows
-    }
-
-    pub async fn insert_into_table(&self, table_inserted_data: TableInsertedData) {
-        let column_names: Vec<String> = table_inserted_data
-            .column_names
-            .iter()
-            .map(|column_name| format!("\"{}\"", column_name.clone()))
-            .collect();
-        let column_values: Vec<String> = table_inserted_data
-            .rows
-            .iter()
-            .map(|row| {
-                format!(
-                    "({})",
-                    zip(row, &table_inserted_data.data_types)
-                        // map each column value to datatype by index in both vectors
-                        // in order to wrap '' on values with text datatypes
-                        .map(|(column_value, ref datatype)| {
-                            match datatype {
-                                DataType::TEXT => format!("'{}'", column_value),
-                                _ => column_value.clone(),
-                            }
-                        })
-                        .collect::<Vec<String>>()
-                        .join(", ")
-                )
-            })
-            .collect();
-        let query = format!(
-            "INSERT INTO \"{}\" ({}) VALUES {}",
-            table_inserted_data.table_name,
-            column_names.join(", "),
-            column_values.join(", ")
-        );
     }
 
     pub async fn alter_table(
